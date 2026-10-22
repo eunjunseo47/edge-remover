@@ -286,37 +286,105 @@ function Invoke-NativeEdgeUninstall {
     return $exitCodes
 }
 
+
 function Remove-EdgeAppxPackages {
     Write-Step 'Removing Edge-related AppX packages...'
 
     $includeWebView = [bool]$RemoveWebView2
-    $patterns = @('MicrosoftEdge', 'Microsoft\.MicrosoftEdge')
+
+    $patterns = @(
+        'MicrosoftEdge'
+        'Microsoft\.MicrosoftEdge'
+    )
+
     if ($includeWebView) {
         $patterns += 'WebView'
     }
 
-    Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
-        Where-Object {
-            $n = $_.Name
-            ($patterns | Where-Object { $n -match $_ }).Count -gt 0 -and
-            ($includeWebView -or ($n -notmatch 'WebView'))
-        } |
-        ForEach-Object {
-            Write-Detail "Removing AppX: $($_.PackageFullName)"
-            Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction SilentlyContinue
+    $matchesPattern = {
+        param([string]$Name)
+
+        if ([string]::IsNullOrWhiteSpace($Name)) {
+            return $false
         }
 
-    Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
-        Where-Object {
-            $d = $_.DisplayName
-            ($patterns | Where-Object { $d -match $_ }).Count -gt 0 -and
-            ($includeWebView -or ($d -notmatch 'WebView'))
-        } |
-        ForEach-Object {
-            Write-Detail "Removing provisioned package: $($_.DisplayName)"
-            Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -ErrorAction SilentlyContinue | Out-Null
+        foreach ($pattern in $patterns) {
+            if ($Name -match $pattern) {
+                return $true
+            }
         }
+
+        return $false
+    }
+
+    Write-Step 'Searching installed Edge AppX packages...'
+
+    $installedPackages = @(
+        Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+    )
+
+    foreach ($package in $installedPackages) {
+        $name = $package.Name
+
+        if (-not (& $matchesPattern $name)) {
+            continue
+        }
+
+        if (-not $includeWebView -and $name -match 'WebView') {
+            continue
+        }
+
+        Write-Detail "Removing AppX: $($package.PackageFullName)"
+
+        try {
+            Remove-AppxPackage `
+                -Package $package.PackageFullName `
+                -AllUsers `
+                -ErrorAction Stop
+
+            Write-Detail "Successfully removed: $($package.PackageFullName)"
+        }
+        catch {
+            Write-Detail "Failed to remove $($package.PackageFullName): $($_.Exception.Message)"
+        }
+    }
+
+    Write-Step 'Searching provisioned Edge AppX packages...'
+
+    $provisionedPackages = @(
+        Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
+    )
+
+    foreach ($package in $provisionedPackages) {
+        $name = $package.DisplayName
+
+        if (-not (& $matchesPattern $name)) {
+            continue
+        }
+
+        if (-not $includeWebView -and $name -match 'WebView') {
+            continue
+        }
+
+        Write-Detail "Removing provisioned package: $($package.DisplayName)"
+
+        try {
+            Remove-AppxProvisionedPackage `
+                -Online `
+                -PackageName $package.PackageName `
+                -ErrorAction Stop |
+                Out-Null
+
+            Write-Detail "Successfully removed provisioned package: $($package.DisplayName)"
+        }
+        catch {
+            Write-Detail "Failed to remove provisioned package $($package.DisplayName): $($_.Exception.Message)"
+        }
+    }
+
+    Write-Step 'Edge-related AppX package removal completed.'
 }
+
 
 function Remove-EdgeDirectories {
     Write-Step 'Removing leftover Edge directories...'
@@ -429,40 +497,91 @@ function Set-EdgeReinstallBlock {
     Write-Ok 'Reinstall block registry keys written.'
 }
 
+
 function Remove-OrphanUninstallEntries {
     Write-Step 'Cleaning orphan uninstall registry entries...'
 
     $paths = @(
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+
+    $targetNames = @(
+        'Microsoft Edge',
+        'Microsoft Edge WebView2 Runtime'
     )
 
     foreach ($regPath in $paths) {
-        Get-ItemProperty $regPath -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.DisplayName -match '^Microsoft Edge( WebView2 Runtime)?$' -and
-                $_.UninstallString -match 'setup\.exe'
-            } |
-            ForEach-Object {
-                $uninstall = $_.UninstallString
-                if ($uninstall -match '"([^"]+setup\.exe)"') {
-                    $setupPath = $Matches[1]
-                }
-                elseif ($uninstall -match '([A-Za-z]:\\[^\s]+setup\.exe)') {
-                    $setupPath = $Matches[1]
-                }
-                else {
-                    return
+        if (-not (Test-Path -LiteralPath $regPath)) {
+            continue
+        }
+
+        $entries = @(
+            Get-ChildItem -LiteralPath $regPath -ErrorAction SilentlyContinue
+        )
+
+        foreach ($entry in $entries) {
+            try {
+                $properties = Get-ItemProperty `
+                    -LiteralPath $entry.PSPath `
+                    -ErrorAction Stop
+
+                $displayName = $properties.DisplayName
+                $uninstallString = $properties.UninstallString
+
+                if ([string]::IsNullOrWhiteSpace([string]$displayName)) {
+                    continue
                 }
 
-                if (-not (Test-Path -LiteralPath $setupPath)) {
-                    $key = ($_.PSPath -replace '^Microsoft\.PowerShell\.Core\\Registry::', '')
-                    Write-Detail "Removing orphan entry: $($_.DisplayName)"
-                    Remove-Item -LiteralPath $key -Recurse -Force -ErrorAction SilentlyContinue
+                if ($targetNames -notcontains $displayName) {
+                    continue
+                }
+
+                if ([string]::IsNullOrWhiteSpace([string]$uninstallString)) {
+                    continue
+                }
+
+                if ($uninstallString -notmatch '(?i)setup\.exe') {
+                    continue
+                }
+
+                $setupPath = $null
+
+                if ($uninstallString -match '"([^"]*setup\.exe)"') {
+                    $setupPath = $Matches[1]
+                }
+                elseif ($uninstallString -match '(?i)([A-Za-z]:\\.*?setup\.exe)') {
+                    $setupPath = $Matches[1].Trim('"')
+                }
+
+                if ([string]::IsNullOrWhiteSpace($setupPath)) {
+                    Write-Detail "Cannot determine setup.exe path for: $displayName"
+                    continue
+                }
+
+                if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) {
+                    Write-Detail "Removing orphan entry: $displayName"
+                    Write-Detail "Registry key: $($entry.Name)"
+                    Write-Detail "Missing executable: $setupPath"
+
+                    Remove-Item `
+                        -LiteralPath $entry.PSPath `
+                        -Recurse `
+                        -Force `
+                        -ErrorAction Stop
+
+                    Write-Detail "Successfully removed orphan entry: $displayName"
                 }
             }
+            catch {
+                Write-Detail "Failed to process registry entry '$($entry.Name)': $($_.Exception.Message)"
+            }
+        }
     }
+
+    Write-Step 'Orphan uninstall registry cleanup completed.'
 }
+
 
 function Enable-EdgeUninstallRegistry {
     Write-Step 'Enabling uninstall flags in Edge uninstall registry keys...'
